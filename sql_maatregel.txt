@@ -1,0 +1,23 @@
+/*
+hoe projecten aan maatregelen zijn gekoppeld in PIB
+
+projecten 
+  deelprojecten 
+    plannen 
+    /\
+    \/
+    ???
+    
+*/
+
+
+
+select pl.naam
+from   prjn pr         
+join   DLPRJN   dp
+on     pr.prj_id = dp.prj_id
+join   pln pl
+on     dp.pln_id = pl.pln_id
+
+where  pr.prj_id = 181
+
