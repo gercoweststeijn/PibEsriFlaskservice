@@ -1,0 +1,815 @@
+"""
+A service to integrate PIB, run on MS powerplatform with the ESRI database where the old PIB scheme resides. 
+Supported
+
+> POST project >  a project ID is returned
+
+
+    > GET projectleiders - a list of projectleider ID is returned 
+        - required to retrieve a projectleider ID > for posting projects
+        
+    > POST projectleiders - a projectleider ID is returned 
+        - in case the projectleider is not yet registered
+
+    > GET afdelingen - a  list of afdeling IDs is returned 
+        - required to retrieve aafedlingen ID > for posting projects
+        
+    > POST afdeling - a afdelingen ID is returned 
+        - in case the afdeling is not yet registered
+
+
+
+Common error HTTP status codes include:
+
+400 Bad Request – This means that client-side input fails validation.
+401 Unauthorized – This means the user isn’t not authorized to access a resource. It usually returns when the user isn’t authenticated.
+403 Forbidden – This means the user is authenticated, but it’s not allowed to access a resource.
+404 Not Found – This indicates that a resource is not found.
+500 Internal server error – This is a generic server error. It probably shouldn’t be thrown explicitly.
+502 Bad Gateway – This indicates an invalid response from an upstream server.
+503 Service Unavailable – This indicates that something unexpected happened on server side (It can be anything like server overload, some parts of the system failed, etc.).
+
+    PYTHON_USERNAME       - your DB username
+    PYTHON_PASSWORD       - your DB password
+    PYTHON_CONNECTSTRING  - the connection string to the DB, e.g. "example.com/XEPDB1"
+    PORT                  - port the web server will listen on.  The default in 8080
+
+"""
+
+import os
+import sys
+import traceback
+# import oracle_cx for connecting to oracle DB
+import cx_Oracle
+# import main Flask class and request object
+from flask import Flask, request , jsonify , abort
+from flask.wrappers import Response
+from flask_api import status
+
+import json
+import jsonschema
+#from jsonschema import validate
+
+app               = Flask(__name__)
+# Connection string variables 
+HOST_NAME         = 'AM009'
+PORT_NUMBER       = '1521'
+SERVICE_NAME      = 'GACC'
+
+DB_USER           = 'PIB'
+DB_PASSWORD       = 'ab56rt47'
+#DIR_ORACLE_CLIENT =  'P:\oracle\ora11g_32bit'
+
+PRJN_schema = { "type": "object",
+                "properties": {
+                                "NAAM":{"type": "string"},
+                                "FMSCODE":{"type": "string"},
+                                "PRJLDR_ID":{"type": "number"},
+                                "AFD_ID":{"type": "number"},
+                                "UITVRINGVAN":{"type": "string"}, # date
+                                "UITVRINGTOT":{"type": "string"}, # date
+                                "VERWIJDERD":{"type": "string"},
+                                "OPMERKING":{"type": "string"},
+                                "OPDRACHTG_ID": {"type": "number"},
+                                "BUDGETH_ID": {"type": "number"},
+                                "PORTEF_ID": {"type": "number"},
+                                "HPRJN_ID": {"type": "number"},
+                                "PROJECTMAP":{"type": "string"},
+                                "CMSLINK":{"type": "string"},
+                                "BBP_ID": {"type": "number"},
+                                "DPROCES_ID": {"type": "number"},
+                                "RBOEKW": {"type": "string"},
+                                "PROCES_ID": {"type": "number"},
+                                "OPMERKINGM":{"type": "string"},
+                                "FINSTATUS":{"type": "string"},
+                                "MIP_ID": {"type": "number"},
+                                "PRJ_BOEKNAAM":{"type": "string"},
+                                "PRJ_BOEKNR":{"type": "string"},
+                                "DISTRICT_ID": {"type": "number"},
+                                "CODACODE":{"type": "string"},
+                                "KENMERK":{"type": "string"},
+                                "OMSCHRIJVING":{"type": "string"}
+                            },
+                "required": ["NAAM","PRJLDR_ID", "AFD_ID"]
+}
+
+
+#
+# Start a connection pool.
+#
+# Doc link: https://cx-oracle.readthedocs.io/en/latest/user_guide/connection_handling.html#connection-pooling
+# init_session(): a 'session callback' to efficiently set any initial state
+# that each connection should have.
+#
+# 
+# NOTE: If you have multiple SQL statements, then them combine all in a PL/SQL anonymous
+# block with BEGIN/END so you only call execute() once.  
+# Note there is no explicit 'close cursor' or 'close connection' required. At the
+# end-of-scope when init_session() finishes, the cursor and connection will be
+# closed automatically.  
+# Note for traffic larger then expected for teh PIB ESRI services this could be added
+#
+# Doc link: https://cx-oracle.readthedocs.io/en/latest/user_guide/connection_handling.html#session-callbacks-for-setting-pooled-connection-state
+#
+def init_session(connection, requestedTag_ignored):
+    cursor = connection.cursor()
+    cursor.execute("""
+        ALTER SESSION SET
+          TIME_ZONE = 'UTC'
+          NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI'""")
+
+# start_pool(): starts the connection pool
+def start_pool():
+
+    # Generally a fixed-size pool is recommended, i.e. pool_min=pool_max.
+    # Here the pool contains 4 connections, which is fine for 4 conncurrent
+    # users.
+    #
+    # The "get mode" is chosen so that if all connections are already in use, any
+    # subsequent acquire() will wait for one to become available.
+
+    pool_min = 4
+    pool_max = 4
+    pool_inc = 0
+    pool_gmd = cx_Oracle.SPOOL_ATTRVAL_WAIT
+
+    print("Connecting to "+ SERVICE_NAME )
+
+    dsn = cx_Oracle.makedsn(HOST_NAME, PORT_NUMBER, service_name=SERVICE_NAME) # if needed, place an 'r' before any parameter in order to address special characters such as '\'.
+
+    pool = cx_Oracle.SessionPool(user=DB_USER,
+                                 password=DB_PASSWORD,
+                                 dsn=dsn,
+                                 min=pool_min,
+                                 max=pool_max,
+                                 increment=pool_inc,
+                                 threaded=True,
+                                 getmode=pool_gmd,
+                                 sessionCallback=init_session)
+
+    return pool
+
+def validate_json(json_data , schema):
+    try:
+         jsonschema.validate(instance=json_data, schema=schema)
+    except jsonschema.exceptions.ValidationError as err:
+        return traceback.format_exc()
+    return 'SUCCES'
+
+
+# def validateJson(jsonData):
+#     try:
+#         validate(instance=jsonData, schema=studentSchema)
+#     except jsonschema.exceptions.ValidationError as err:
+#         return False
+#     return True
+
+
+# Display a welcome message on the 'home' page
+@app.route('/')
+def index():
+    return "Welcome to the PIB/ESRI 'project en maatregel' api locatie"
+
+
+def succes_200_msg (data):
+    response = jsonify( {  "succes": "succes"
+                          ,"data" : data } 
+                     )
+    return response
+
+#
+# NOTE on use of bind variables in cxoracle
+# Bound variables are, as always for Oracle, denoted with a ':'
+# Inbound variables are bound by either name or order
+# # outbound variables require the use of a variabel eg: 
+#     out_val = cursor.var(int)
+#     cursor.execute("""
+#             begin
+#                 :out_val := :in_bind_var1 + :in_bind_var2;
+#             end;""",
+#             out_val=out_val, in_bind_var1=8, in_bind_var2=7)
+#     print(out_val.getvalue())        # will print 15 
+
+@app.route('/projects', methods=['POST'])
+def post_project(): 
+    try: 
+        connection = pool.acquire()
+        cursor = connection.cursor()
+        #retrieve request 
+        try:  
+            request_data = request.get_json()
+        except: 
+            return "Invalid (json) request", status.HTTP_400_BAD_REQUEST
+        
+        #validate incoming json > throw http 400 when not valite
+        valid = validate_json(json_data = request_data, schema = PRJN_schema) 
+        if not valid == 'SUCCES' :            
+            return valid, status.HTTP_400_BAD_REQUEST
+
+        prjid_out_val = cursor.var(int)
+        # anonomous block to insert project and retrieve returning value of prj_id
+        cursor.execute("""
+                            begin 
+                                INSERT
+                                INTO PRJN
+                                (
+                                  NAAM,
+                                  FMSCODE,
+                                  PRJLDR_ID,  -- not Noneable 
+                                  AFD_ID,     -- not Noneable
+                                  UITVRINGVAN,
+                                  UITVRINGTOT,
+                                  VERWIJDERD,
+                                  OPMERKING,
+                                  OPDRACHTG_ID,
+                                  BUDGETH_ID,
+                                  PORTEF_ID,
+                                  HPRJN_ID,
+                                  PROJECTMAP,
+                                  CMSLINK,
+                                  BBP_ID,
+                                  DPROCES_ID,
+                                  RBOEKW,
+                                  PROCES_ID,
+                                  OPMERKINGM,
+                                  FINSTATUS,
+                                  MIP_ID,
+                                  PRJ_BOEKNAAM,
+                                  PRJ_BOEKNR,
+                                  DISTRICT_ID,
+                                  CODACODE,
+                                  KENMERK,
+                                  OMSCHRIJVING
+                                )
+                                VALUES
+                                (
+                                  :NAAM,
+                                  :FMSCODE,
+                                  :PRJLDR_ID,
+                                  :AFD_ID,
+                                  :UITVRINGVAN,
+                                  :UITVRINGTOT,
+                                  :VERWIJDERD,
+                                  :OPMERKING,
+                                  :OPDRACHTG_ID,
+                                  :BUDGETH_ID,
+                                  :PORTEF_ID,
+                                  :HPRJN_ID,
+                                  :PROJECTMAP,
+                                  :CMSLINK,
+                                  :BBP_ID,
+                                  :DPROCES_ID,
+                                  nvl(:RBOEKW,0), -- not Noneable but (default) to be set to 0
+                                  :PROCES_ID,
+                                  :OPMERKINGM,
+                                  nvl(:FINSTATUS,0), -- not Noneable but (default) to be set to 0
+                                  :MIP_ID,
+                                  :PRJ_BOEKNAAM,
+                                  :PRJ_BOEKNR,
+                                  :DISTRICT_ID,
+                                  :CODACODE,
+                                  :KENMERK,
+                                  :OMSCHRIJVING
+                                )
+                                returning  PRJ_ID into :out_prj_id;
+                                commit;          
+                            end;  
+                        """
+                        # out bind variable
+                        ,out_prj_id = prjid_out_val
+                        # in bind variable
+                        #
+                        # NOTE: we try to retrieve values from the request message
+                        # If a field is not supplied We pass None to the bind variabel 
+                        # Note that due to the validation this should not be able to occur for the id. :-)
+                        #
+                        ,NAAM = request_data.get('NAAM', None)
+                        ,FMSCODE = request_data.get('FMSCODE', None)
+                        ,PRJLDR_ID = request_data.get('PRJLDR_ID', )
+                        ,AFD_ID = request_data.get('AFD_ID', None)
+                        ,UITVRINGVAN = request_data.get('UITVRINGVAN', None)
+                        ,UITVRINGTOT = request_data.get('UITVRINGTOT', None )
+                        ,VERWIJDERD = request_data.get('VERWIJDERD', None)
+                        ,OPMERKING = request_data.get('OPMERKING', None )
+                        ,OPDRACHTG_ID = request_data.get('OPDRACHTG_ID', None)
+                        ,BUDGETH_ID = request_data.get('BUDGETH_ID', None)
+                        ,PORTEF_ID = request_data.get('PORTEF_ID', None )
+                        ,HPRJN_ID = request_data.get('HPRJN_ID', None)
+                        ,PROJECTMAP = request_data.get('PROJECTMAP',None )
+                        ,CMSLINK = request_data.get('CMSLINK',None )
+                        ,BBP_ID = request_data.get('BBP_ID',None )
+                        ,DPROCES_ID = request_data.get('DPROCES_ID',None )
+                        ,RBOEKW = request_data.get('RBOEKW',None )
+                        ,PROCES_ID = request_data.get('PROCES_ID', None)
+                        ,OPMERKINGM = request_data.get('OPMERKINGM', None)
+                        ,FINSTATUS = request_data.get('FINSTATUS', None)
+                        ,MIP_ID = request_data.get('MIP_ID', None )
+                        ,PRJ_BOEKNAAM = request_data.get('PRJ_BOEKNAAM',None )
+                        ,PRJ_BOEKNR = request_data.get('PRJ_BOEKNR', None)
+                        ,DISTRICT_ID = request_data.get('DISTRICT_ID',None )
+                        ,CODACODE = request_data.get('CODACODE',None )
+                        ,KENMERK = request_data.get('KENMERK',None )
+                        ,OMSCHRIJVING = request_data.get('OMSCHRIJVING', None)
+                        )
+        return_data = request_data
+        return_data.update ({"PRJ_ID": prjid_out_val.getvalue()})
+        return succes_200_msg (return_data), 200
+    
+    except: 
+        # in case of any unforseen errors return 503 with traceback
+        print( traceback.format_exc())
+        # return internal server error
+        ret_val = jsonify({"succes": "ERROR",
+                        "data": traceback.format_exc()})
+        return ret_val, 500
+
+def output_type_handler(cursor, name, default_type, size, precision, scale):
+    if default_type == cx_Oracle.DB_TYPE_CLOB:
+        return cursor.var(cx_Oracle.DB_TYPE_LONG, arraysize=cursor.arraysize)
+    if default_type == cx_Oracle.DB_TYPE_BLOB:
+        return cursor.var(cx_Oracle.DB_TYPE_LONG_RAW, arraysize=cursor.arraysize)
+
+
+
+@app.route('/deelprojecten', methods=['POST'])
+def post_deel_project():
+    try: 
+            connection = pool.acquire()
+            cursor = connection.cursor()
+            #retrieve request 
+            try:  
+                request_data = request.get_json()
+            except: 
+                return "Invalid (json) request", status.HTTP_400_BAD_REQUEST
+            
+            ##validate incoming json > throw http 400 when not valite
+            #valid = validate_json(json_data = request_data, schema = PRJN_schema) 
+            #if not valid == 'SUCCES' :            
+            #    return valid, status.HTTP_400_BAD_REQUEST
+
+            #json_out_val = cursor.var(clob)
+
+            # so we can retrieve a clob(json)
+           
+            ret_val = cursor.var(cx_Oracle.LONG_STRING, arraysize=cursor.arraysize)
+            
+            cursor.execute(
+                        """
+                        declare
+
+                            -- cursors
+                            cursor c_programma (v_naam stmprg.naam%type)
+                            is
+                            select stmprg_id
+                            from   stmprg prg
+                            where  prg.naam = v_naam
+                            ;
+
+                            cursor c_maatregel (v_naam stmmtrn.naam%type, v_programma_id stmmtrn.stmprg_id%type)
+                            is
+                            select mtr.stmmtrgl_id
+                            from   stmmtrn      mtr
+                            where  mtr.naam = v_naam
+                            ;
+
+                            cursor c_fasering
+                            is
+                            select fsr_id
+                            from   stmfsrn
+                            ;
+
+                            cursor c_afdeling (v_afd_naam stmafd.naam%type)
+                            is
+                            select afd.afd_id
+                            from   stmafd afd
+                            where  afd.naam = v_afd_naam
+                            ;
+
+                            cursor c_projectleider (v_prjleider_naam stmprjldr.naam%type)
+                            is
+                            select prl.prjldr_id
+                            from   stmprjldr prl
+                            where  prl.naam = v_prjleider_naam
+                            ;
+
+
+                            cursor c_json_result (v_dlprj_id dlprjn.DLPRJ_ID%type)
+                            is
+                            select json_object ('deelproject id' value  dprj.DLPRJ_ID
+                                                ,'gsntgbikn'      value  dprj.gsntgbikn
+                                                ,'aantal stuks'  value  dprj.aantal_stuks
+                                                ,'planning'      value  json_object ('pln id'          value pln.pln_id
+                                                                                    ,'detail planning' value     -- we moeten onderstaande aggridatie waarden eerst in een json object verpakken,  
+                                                                                                                -- omdat de aggrigatiefunctie maar 1 argument accepteert
+                                                                                                                (select json_objectagg ('fasering' value ( json_object  (  'plndet' value pld.plndet_id
+                                                                                                                                                                        , 'fsr id'   value fas.fsr_id
+                                                                                                                                                                        , 'fasering naam' value fas.naam
+                                                                                                                                                                        )
+                                                                                                                                                                )                    
+                                                                                                                                        )
+                                                                                                                from    plndet pld
+                                                                                                                join    stmfsrn fas
+                                                                                                                on      pld.fsr_id = fas.fsr_id
+                                                                                                                where   pld.pln_id = pln.pln_id
+                                                                                                                )
+                                                                                    
+                                                                                    )
+                                                ,'project' value (select      json_object ( 'project id'          value pr.prj_id
+                                                                                        ,'project naam'        value pr.naam
+                                                                                        ,'afdeling naam'       value afd.naam
+                                                                                        ,'projectleider naam'  value pr.naam
+                                                                                        ) 
+                                                                from        prjn pr
+                                                                left join   stmafd afd
+                                                                on          pr.afd_id = afd.afd_id
+                                                                left join   stmprjldr pl
+                                                                on          pr.prjldr_id = pl.prjldr_id
+                                                                where       pr.prj_id = dprj.prj_id
+                                                                )
+                                                
+                                            ,'maatregel' value (select  json_object ('maatregel id'       value maa.stmmtrgl_id
+                                                                                    ,'maatregel naam'     value maa.naam
+                                                                                    ,'maatregel eenheid'  value  maa.eenheid
+                                                                                    ,'maatregel gisactie' value maa.gis_actie
+                                                                                    ,'programma' value json_object ( 'programma id'   value prg.stmprg_id
+                                                                                                                    ,'programma naam' value prg.naam)
+                                                                                    )
+                                                                from     stmmtrn  maa
+                                                                join     stmprg   prg
+                                                                on       maa.stmprg_id = prg.stmprg_id
+                                                                where    maa.stmmtrgl_id = dprj.stmmtrgl_id
+                                                                )                        
+                                                )  result
+                            from         dlprjn  dprj -- deelprojecten 
+                            left join    pln pln
+                            on           dprj.pln_id = pln.pln_id
+                            left join    plndet pld
+                            on           pln.pln_id = pld.pln_id
+                            where        dprj.dlprj_id  = v_dlprj_id
+                            ;
+
+
+                            --=====================
+                            -- variables
+                            --======================
+
+                            l_afdeling_id       stmafd.afd_id%type;
+                            l_projectleider_id  stmprjldr.prjldr_id%type;
+                            l_project_id        prjn.prj_id%type;
+                            l_maatregel_id      stmmtrn.stmmtrgl_id%type;
+                            l_planning_id       pln.pln_id%type;
+                            l_programma_id      stmprg.stmprg_id%type;
+                            l_deelproject_id    dlprjn.dlprj_id%type;
+
+                            -- input waarden
+                            l_new_programma_naam          stmprg.naam%type;
+                            l_new_afdeling_naam           stmafd.naam%type;
+                            l_new_projectleider_naam      stmprjldr.naam%type;
+                            l_new_maatregel_naam          stmmtrn.naam%type;
+                            l_new_maatregel_eenheid       stmmtrn.eenheid%type;
+                            l_new_maatregel_gisactie      stmmtrn.gis_actie%type;
+                            l_new_planning_naam           pln.naam%type;
+                            l_new_aantal_stuk_deelplan    dlprjn.aantal_stuks%type;
+                            -- 
+                            r_result clob;
+
+
+                            -- ***********
+                            -- begin script
+                            -- ***********
+                            begin
+
+                            --
+                            --  set de bind variabelen
+                            --
+                            l_new_afdeling_naam        := :AFDELINGSNAAM;
+                            l_new_projectleider_naam   := :PROJECTLEIDER;
+                            l_new_programma_naam       := :PROGRAMMA;
+                            l_new_maatregel_naam       := :MAATREGEL;
+                            l_new_maatregel_eenheid    := :EENHEID;
+                            l_new_maatregel_gisactie   := 1; -- true 
+                            l_new_planning_naam        := :PLANNINGSNAAM;
+                            l_new_aantal_stuk_deelplan := :AANTAL_STUK;
+
+
+                            --====================
+                            --bepaal de afdeling
+                            --====================
+                            open c_afdeling (v_afd_naam => l_new_afdeling_naam);
+                            fetch c_afdeling
+                            into  l_afdeling_id;
+
+                            if c_afdeling%notfound
+                            then
+                            insert into stmafd
+                                (
+                                naam
+                                ,verwijderd
+                                )
+                                values
+                                (
+                                l_new_afdeling_naam
+                                ,0 -- niet verwijderd
+                                )
+                                returning afd_id into l_afdeling_id
+                                ;
+
+                            end if;
+                            close c_afdeling;
+
+                            --====================
+                            --bepaal de projectleider
+                            --====================
+                            open c_projectleider(v_prjleider_naam => l_new_projectleider_naam);
+                            fetch c_projectleider
+                            into  l_projectleider_id;
+
+                            if c_projectleider%notfound
+                            then
+                            -- om een of andere reden lijkt de trigger met ophalen van de sequence niet te werken ?!
+                            select stmprjldr_seq.nextval
+                            into   l_projectleider_id
+                            from   dual; 
+
+                            insert into stmprjldr
+                                (
+                                prjldr_id,
+                                naam,
+                                verwijderd
+                                )
+                                values
+                                (
+                                l_projectleider_id
+                                ,l_new_projectleider_naam
+                                ,0 -- not verwijderd
+                                )
+                            returning prjldr_id into l_projectleider_id;
+                            
+                            end if;
+                            close c_projectleider;
+
+                            --====================
+                            --voer project op
+                            -- we voegen eerst een project toe
+                            -- dit doen we altijd, we nemen aan dat als er in pib een project opgevoerd moet worden dat dat hier ook zo is
+                            -- met andere woorden, we vragen het niet ui
+                            --====================
+                            insert
+                            into prjn
+                            (
+                                naam,
+                                prjldr_id,
+                                afd_id,
+                                omschrijving
+                            )
+                            values
+                            (
+                                'test'||to_char(sysdate,'mm-dd-yyyy hh24:mi:ss')
+                            , l_projectleider_id
+                            , l_afdeling_id
+                            , 'test'||to_char(sysdate, 'mm-dd-yyyy hh24:mi:ss')
+                            )
+                            return prj_id into l_project_id
+                            ;
+
+                            /*
+                            ============
+                            insert porgramma of haal de gevraagde op
+                            ============
+                            */
+                            open c_programma (v_naam => l_new_programma_naam);
+                            fetch c_programma
+                            into  l_programma_id;
+
+                            if c_programma%notfound
+                            then
+                            -- merge om programma(naam) op te halen.
+                            -- stam gegegen programma
+                            insert into stmprg
+                                (
+                                naam
+                                ) 
+                                values
+                                (
+                                l_new_programma_naam
+                                )
+                                returning stmprg_id into l_programma_id;
+                            end if;
+                            close c_programma;
+
+
+                            /*
+                            ============
+                            insert maatregel onder programma of haal op
+                            ============
+                            */
+                            open c_maatregel (v_naam => l_new_maatregel_naam, v_programma_id => l_programma_id);
+                            fetch c_maatregel
+                            into  l_maatregel_id;
+
+                            if c_maatregel%notfound
+                            then
+                            insert
+                            into stmmtrn
+                                (  naam
+                                ,eenheid
+                                ,stmprg_id
+                                ,gis_actie
+                                )
+                                values
+                                (
+                                l_new_maatregel_naam
+                                ,l_new_maatregel_eenheid
+                                ,l_programma_id
+                                ,l_new_maatregel_gisactie
+                                )
+                                returning stmmtrgl_id into l_maatregel_id;
+                            end if;
+                            close c_maatregel;
+
+
+                            --===============================================================
+                            --vervolgens koppelen we een project aan een maatregel via
+                            --- een planning
+                            -- op een deelproject
+                            --===============================================================
+
+                            -- planning
+                            insert into pln
+                            (
+                                --pln_id,
+                                naam
+                            ,mtrglsfgrnd
+                            ,mtrglskwrtl
+                            ,mtrglsjr
+                            )
+                            values
+                            (
+                                --:v0,
+                                l_new_planning_naam
+                                ,'0'
+                                ,null
+                                ,null
+                            )
+                            returning pln_id into l_planning_id
+                            ;
+
+                            -- insert een (plndet) fasering // we voegen maar alle fases toe veel plz!
+                            for r_fasering in c_fasering
+                            loop
+                            insert into plndet
+                                (
+
+                                fsr_id
+                                ,pln_id
+
+                                )
+                                values
+                                (
+
+                                r_fasering.fsr_id
+                                ,l_planning_id
+                                );
+                            end loop;
+
+
+                            --===============================================================
+                            -- kopppel een maatregel aan een project via een deelproject
+                            -- dit triggert het aanmaken van een geo-object
+                            --===============================================================
+                            insert
+                            into dlprjn
+                            (
+                                --dlprj_id,
+                            /* sgbp,
+                                vrsprdbr,
+                                ntvrsprdbr,
+                                nitvrsprdbr,
+                                wtropg_id,
+                                ggor_id,*/
+                            --    kenmerk,
+                            --    opmerking,
+                                prj_id,
+                                aantal_stuks,
+                                stmmtrgl_id,
+                                pln_id,
+                                gsntgbikn
+                            --    verwijderd,
+                            --    mtrglpln,
+                            --    mtrglger,
+                            --    mtrglver
+                            )
+                            values
+                            (
+                                --dlprj_id,
+
+                            --    sgbp,
+                            --    vrsprdbr,
+                            --    ntvrsprdbr,
+                            --    nitvrsprdbr,
+                            --    wtropg_id,
+                            --    ggor_id,
+
+                            --     null
+                            --    ,null
+                                l_project_id -- prj_id,
+                                ,l_new_aantal_stuk_deelplan-- aantal_stuks,
+                                ,l_maatregel_id -- maar eigenlijk ophalen   stmmtrgl_id, -- stmmtrgl_id >> not nullable
+                                ,l_planning_id
+
+                                ,0
+                            --    verwijderd,
+                            --    mtrglpln,
+                            --    mtrglger,
+                            --    mtrglver
+                            )
+                            returning dlprj_id into l_deelproject_id ;
+
+                            open c_json_result (v_dlprj_id => l_deelproject_id);
+                            fetch c_json_result 
+                            into  :r_result; 
+                            
+                            close c_json_result;
+                            
+                            end;    
+                        """
+                        # out bind variable
+                        ,r_result = ret_val
+                        
+                        # in bind variable
+                        #
+                        # NOTE: we try to retrieve values from the request message
+                        # If a field is not supplied We pass None to the bind variabel 
+                        # Note that due to the validation this should not be able to occur for the id. :-)
+                        #
+                        ,AFDELINGSNAAM = 'Dummy_afd'
+                        ,PROJECTLEIDER = 'Dummy_pl'
+                        ,PROGRAMMA     = 'Dummt_pro'
+                         ,MAATREGEL     = 'Dummy_maat'
+                         ,EENHEID       = 'Km'
+                        
+                         ,PLANNINGSNAAM = 'Standaardplanning'
+                         ,AANTAL_STUK   = 1
+                        
+                        )
+            return_data = ret_val
+            #return succes_200_msg (return_data), 200
+            return str(ret_val)
+    except: 
+        # in case of any unforseen errors return 503 with traceback
+        print( traceback.format_exc())
+        # return internal server error
+        ret_val = jsonify({"succes": "ERROR",
+                        "data": traceback.format_exc()})
+        return ret_val, 500
+
+
+################################################################################
+#
+# Initialization is done once at startup time
+################################################################################
+if __name__ == '__main__':
+    
+    #cx_Oracle.init_oracle_client
+    #cx_Oracle.init_oracle_client(DIR_ORACLE_CLIENT)
+    
+
+    # Start a pool of connections
+    pool = start_pool()
+
+    # Create a demo table
+    #create_schema()
+
+    # Start a webserver
+    app.run(port=int(os.environ.get('PORT', '8080')))
+
+
+# {
+#    "NAAM":"HIER EEN NAAM",
+#    "FMSCODE":"",
+#    "PRJLDR_ID":41,
+#    "AFD_ID":7,
+#    "UITVRINGVAN":"",
+#    "UITVRINGTOT":"",
+#    "VERWIJDERD":"",
+#    "OPMERKING":"",
+#    "OPDRACHTG_ID":,
+#    "BUDGETH_ID":,
+#    "PORTEF_ID":,
+#    "HPRJN_ID":,
+#    "PROJECTMAP":"",
+#    "CMSLINK":"",
+#    "BBP_ID":,
+#    "DPROCES_ID":,
+#    "RBOEKW":"",
+#    "PROCES_ID":,
+#    "OPMERKINGM":"",
+#    "FINSTATUS":"",
+#    "MIP_ID":,
+#    "PRJ_BOEKNAAM":"",
+#    "PRJ_BOEKNR":"",
+#    "DISTRICT_ID":,
+#    "CODACODE":"i12345",
+#    "KENMERK":"",
+#    "OMSCHRIJVING":"hier een omschrijving"
+# }
